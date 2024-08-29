@@ -1,0 +1,8 @@
+
+name = "Item"
+
+paths = [
+[["itm", "id"], "String"],
+[["itm", "type"], "String"],
+]
+

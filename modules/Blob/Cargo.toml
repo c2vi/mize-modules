@@ -1,0 +1,11 @@
+[package]
+name = "mize_module_Blob"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mize = { path = "../../../" }
+tracing = "0.1.40"
+
+[lib]
+crate-type = ["cdylib", "rlib", "staticlib"]
