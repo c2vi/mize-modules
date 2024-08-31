@@ -1,9 +1,9 @@
 [submodule "modules/mme"]
 	path = modules/mme
-	url = git@github.com:c2vi/mme.git
+	url = https://github.com/c2vi/mme
 [submodule "modules/vic"]
 	path = modules/vic
-	url = git@github.com:c2vi/victorinix.git
+	url = https://github.com/c2vi/victorinix
 [submodule "modules/comandr"]
 	path = modules/comandr
-	url = git@github.com:c2vi/comandr.git
+	url = https://github.com/c2vi/comandr
