@@ -1,0 +1,6 @@
+{ craneLib
+, ...
+}:
+craneLib.buildPackage {
+  src = ./.;
+}
