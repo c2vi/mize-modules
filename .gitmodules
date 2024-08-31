@@ -1,0 +1,9 @@
+[submodule "modules/mme"]
+	path = modules/mme
+	url = git@github.com:c2vi/mme.git
+[submodule "modules/vic"]
+	path = modules/vic
+	url = git@github.com:c2vi/victorinix.git
+[submodule "modules/comandr"]
+	path = modules/comandr
+	url = git@github.com:c2vi/comandr.git
