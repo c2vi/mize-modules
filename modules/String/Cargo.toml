@@ -1,5 +1,5 @@
 [package]
-name = "mize_module_Blob"
+name = "mize_module_String"
 version = "0.1.0"
 edition = "2021"
 
