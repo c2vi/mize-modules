@@ -6,4 +6,5 @@
 mkMizeRustModule {
   src = ./.;
   modName = "String";
+  test = "hiiiiiiiiiiiiiii";
 }
