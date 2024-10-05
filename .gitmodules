@@ -4,6 +4,3 @@
 [submodule "modules/vic"]
 	path = modules/vic
 	url = https://github.com/c2vi/victorinix
-[submodule "modules/comandr"]
-	path = modules/comandr
-	url = https://github.com/c2vi/comandr
