@@ -1,0 +1,42 @@
+set -e
+
+export MIZE_CONFIG=module_dir.dev=/home/me/work/modules/modules/dev/dist 
+
+function build_mize_dev() {
+
+  #RUST_BACKTRACE=full RUST_LOG=trace 
+  export MIZE_MODULE_PATH=/home/me/work/mme:/home/me/work/modules:/home/me/work/presenters
+  export MIZE_MODULE_NO_REPO=1
+  export MIZE_MODULE_NO_EXTERNALS=1
+
+  cd ~/work/modules/modules/dev
+  nix develop ~/work/mize#modules.dev --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 --impure -c cargo build --lib
+
+
+  mkdir -p ~/work/modules/modules/dev/dist/lib
+  cp ~/work/modules/modules/dev/target/debug/libmize_module_dev.so ~/work/modules/modules/dev/dist/lib
+
+  cd ~/work/mize
+  nix develop --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 --impure -c cargo build
+
+}
+
+if [[ "$1" == "b" ]]
+then
+  build_mize_dev
+  /home/me/work/mize/target/debug/mize dev
+
+elif [[ "$1" == "bo" ]]
+then
+  build_mize_dev
+
+else
+
+  /home/me/work/mize/target/debug/mize dev $@
+
+fi
+
+
+
+
+

@@ -1,0 +1,17 @@
+
+
+export MIZE_MODULE_PATH=/home/me/work/mme:/home/me/work/modules:/home/me/work/presenters
+export MIZE_MODULE_NO_REPO=1
+export MIZE_MODULE_NO_EXTERNALS=1
+export MIZE_CONFIG=$MIZE_CONFIG:module_dir.dev=/home/me/work/modules/modules/dev/dist
+
+function dev() {
+
+	nix develop /home/me/work/mize#modules.dev --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 --impure
+
+}
+
+if [[ "$1" != "no" ]]
+then
+	dev
+fi
