@@ -29,10 +29,11 @@ const SELECTED_STYLE: Style = Style::new().bg(SLATE.c800).add_modifier(Modifier:
 const TEXT_FG_COLOR: Color = SLATE.c200;
 const COMPLETED_TEXT_FG_COLOR: Color = GREEN.c500;
 
-pub fn run_tui(data: DevModuleData, instance: Instance) -> MizeResult<()> {
+pub fn run_tui(data: DevModuleData, instance: &Instance) -> MizeResult<()> {
     color_eyre::install()?;
     let terminal = ratatui::init();
     let app = App {
+        instance: instance.clone(),
         should_exit: false,
         data,
         dev_shells: Vec::new(),
@@ -40,11 +41,12 @@ pub fn run_tui(data: DevModuleData, instance: Instance) -> MizeResult<()> {
     };
     let app_result = app.run(terminal);
     ratatui::restore();
-    app_result.mize_result_msg("error with tui app")
+    app_result
 }
 
 
 struct App {
+    instance: Instance,
     should_exit: bool,
     data: DevModuleData,
     dev_shells: Vec<Command>,
@@ -53,22 +55,21 @@ struct App {
 
 
 impl App {
-    fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+    fn run(mut self, mut terminal: DefaultTerminal) -> MizeResult<()> {
         while !self.should_exit {
-            println!("hiiiiiiiiiiiii");
 
             terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
 
             if let Event::Key(key) = event::read()? {
-                self.handle_key(key);
+                self.handle_key(key)?;
             };
         }
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) -> MizeResult<()> {
         if key.kind != KeyEventKind::Press {
-            return;
+            return Ok(());
         }
 
         // CTRL+c should also exit
@@ -84,11 +85,13 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.modules_state.select_first(),
             KeyCode::Char('G') | KeyCode::End => self.modules_state.select_last(),
 
-            KeyCode::Char('r') | KeyCode::End => crate::run_build(&self.data, &self.instance),
+            KeyCode::Char('r') | KeyCode::End => crate::run_build(&self.data, &self.instance)?,
 
-            KeyCode::Char('a') | KeyCode::End => crate::run_build(&self.data, &self.instance),
+            // TODO: KeyCode::Char('a') | KeyCode::End => tui_add_buildable(&mut self.data),
             _ => {}
-        }
+        };
+
+        Ok(())
     }
 
     /// Changes the status of the selected list item

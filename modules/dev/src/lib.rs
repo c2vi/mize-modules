@@ -1,5 +1,6 @@
 
 // to check if a src changed: find . -not \( -path ./target -prune \) -newermt "2025-01-08 17:26:10"
+#![ allow( warnings ) ]
 
 use std::ffi::OsString;
 use std::fs;
@@ -29,7 +30,9 @@ use cmd_lib::run_fun;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use cmd_lib::run_fun;
+use ciborium::Value as CborValue;
+use clap::ArgMatches;
+use clap::Arg;
 
 
 pub mod tui;
@@ -39,10 +42,10 @@ pub mod tui;
 pub struct DevModule {
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct DevModuleData {
     last_build: u32,
-    mize_flake: PathBuf,
+    mize_flake: String,
     buildables: Vec<Buildable>,
 }
 
@@ -78,17 +81,17 @@ impl mize::Module for DevModule {
     }
 
     fn run_cli(&mut self, instance: &Instance, cmd_line: Vec<OsString>) -> Option<MizeResult<()>> {
-        let cli = ClapCommand::new("mize_module_dev")
-            .about("The MiZe Command line tool")
+        let cli = ClapCommand::new("dev")
+            .about("The MiZe dev module")
             .subcommand(
-                Command::new("add")
+                ClapCommand::new("add")
                 .aliases(["a"])
                 .about("add a module")
                 .arg(Arg::new("name")
                     .help("the name of the module to build")
                 )
-                .arg(Arg::new("path")
-                    .help("the path or the module")
+                .arg(Arg::new("src-path")
+                    .help("the source path or the module")
                 )
                 .arg(Arg::new("config")
                     .help("the modName or build-config of the module")
@@ -99,17 +102,21 @@ impl mize::Module for DevModule {
                     .short('s')
                     .help("the modName or build-config of the module")
                 )
-                .arg(Arg::new("src-path")
-                    .long("src-path")
-                    .short('p')
-                    .help("the path to the module's source")
-                )
+            )
+            .subcommand(
+                ClapCommand::new("list")
+                .aliases(["ls"])
+                .about("list all modules/buildables in current dev env")
             )
         ;
+        let cmd: Vec<&str> = cmd_line.iter().map(|s|s.to_str().expect("")).collect();
+        println!("cmdline: {:?}", cmd);
         let matches = cli.get_matches_from(cmd_line);
 
         let res = match matches.subcommand() {
             Some(("add", sub_matches)) => cmd_add_buildable(self, instance, sub_matches),
+            Some(("list", sub_matches)) => cmd_list_buildable(self, instance, sub_matches),
+            Some((cmd, _)) => { return Some(Err(mize_err!("unknown subcommand '{}'", cmd)));},
             None => enter_dev_env(self, instance),
         };
 
@@ -119,12 +126,12 @@ impl mize::Module for DevModule {
 }
 
 
-fn enter_dev_env(dev_module: &mut DevModule, instance: Instance) -> MizeResult<()> {
+fn enter_dev_env(dev_module: &mut DevModule, instance: &Instance) -> MizeResult<()> {
 
 
     ///////////////// read the mize_dev.json file
     // in the future, this data should be stored in the instance itself
-    let data = load_data(&instance);
+    let data = load_data(instance)?;
 
     ///////////////// spawn all dev shells for all ModuleToBuild
     let dev_shells: Vec<Command> = Vec::new();
@@ -144,7 +151,7 @@ impl Default for DevModuleData {
         DevModuleData {
             last_build: 0,
             buildables: Vec::new(),
-            mize_flake: "github:c2vi/mize",
+            mize_flake: "github:c2vi/mize".to_owned(),
         }
     }
 }
@@ -167,57 +174,34 @@ pub fn load_data(instance: &Instance) -> MizeResult<DevModuleData> {
 pub fn store_data(instance: &Instance, data: DevModuleData) -> MizeResult<()> {
     let data_path = PathBuf::from(instance.get("0/config/store_path")?.value_string()?).join("mize_dev_data.json");
 
-    serde_json::to_writer(File::open(&data_path)?, &data)
+    serde_json::to_writer(File::options().write(true).open(&data_path)?, &data)
         .mize_result_msg("failed to encode DevModuleData into json with serde")?;
 
     Ok(())
 }
 
 
-pub fn cmd_add_buildable(module: DevModule, instance: Instance, sub_matches: &ArgMatches) -> MizeResult<()> {
+pub fn cmd_list_buildable(module: &mut DevModule, instance: &Instance, sub_matches: &ArgMatches) -> MizeResult<()> {
+    let mut data = load_data(&instance)?;
 
-    let data = load_data(&instance)?;
+    println!("Buildables:");
+    for buildable in &data.buildables {
+        println!("{} \t\t active:{} \t\t at:{}", buildable.name, buildable.active, buildable.src_path.display())
+    }
 
-    let name = sub_matches.get_one::<str>("name")?;
+    store_data(&instance, data)?;
 
-    let src_path = PathBuf::from_str(sub_matches.get_one::<str>("src-path")?);
+    Ok(())
+}
 
-    let config = match sub_matches.get_one::<str>("config") {
-        None => {
-            ItemData::new()
-            // TODO: get modName from the only module, which is in this folder... error if there
-            // are multiple
-        },
-        Some(config_string) => {
-            if !config_str.contains("=") {
-                let config_string = format!("modName={}", config);
-                config_str = config_string.as_str();
-            };
-            let config = data_from_string(config_str.to_owned())?;
-            config
-        },
-    };
 
-    let mod_name = config.get_path("modName");
+pub fn cmd_add_buildable(module: &mut DevModule, instance: &Instance, sub_matches: &ArgMatches) -> MizeResult<()> {
 
-    let system_str = "x86_64-linux"; // TODO: get from config or use currentSystem
+    let mut data = load_data(&instance)?;
 
-    let expr = format!(r#"
-        let 
-            mize = getFlake {data.mize_flake};
-            mizeBuildPhase = mize.mizeFor.{system_str}.modules.{mod_name}.mizeBuildPhase;
-            mizeInstallPhase = mize.mizeFor.{system_str}.modules.{mod_name}.mizeInstallPhase;
-        in mizeBuildPhase ++ mizeInstallPhase
-    "#);
-    let command = run_fun!(MIZE_MODULE_NO_REPO=1 MIZE_MODULE_NO_EXTERNALS=1 MIZE_MODULE_PATH=${src_path} nix eval --impure --raw --expr $expr)?;
+    add_buildable(&mut data, sub_matches)?;
 
-    let buildable = Buildable {
-        name,
-        active: true,
-        config,
-        src_path,
-        command: String,
-    };
+    store_data(&instance, data)?;
 
     Ok(())
 }
@@ -226,6 +210,66 @@ pub fn cmd_add_buildable(module: DevModule, instance: Instance, sub_matches: &Ar
 pub fn run_build(data: &DevModuleData, instance: &Instance) -> MizeResult<()> {
 
 
+
+    Ok(())
+}
+
+pub fn add_buildable(data: &mut DevModuleData, sub_matches: &ArgMatches) -> MizeResult<()> {
+
+    let name = sub_matches.get_one::<String>("name")
+        .ok_or(mize_err!("no name argument"))?;
+
+    let src_path = PathBuf::from_str(
+            sub_matches.get_one::<String>("src-path")
+            .ok_or(mize_err!("no src-path argument"))?
+            .as_str()
+        )?;
+
+    let config: ItemData = match sub_matches.get_one::<String>("config") {
+        None => {
+            ItemData::new()
+            // TODO: get modName from the only module, which is in this folder... error if there
+            // are multiple
+        },
+        Some(mut config_str) => {
+            let mut tmp = String::new();
+            if !config_str.contains("=") {
+                tmp = format!("modName={}", config_str);
+                config_str = &tmp
+            };
+
+            let config = data_from_string((*config_str).to_owned())?;
+            config
+        },
+    };
+
+    let mod_name = config.get_path("config/modName")?.value_string()?;
+    println!("config: {}", config);
+    println!("modName: {}", mod_name);
+
+    let system_str = "x86_64-linux-gnu"; // TODO: get from config or use currentSystem
+
+    let expr = format!(r#"
+        let 
+            mize = builtins.getFlake "{}";
+            mizeBuildPhase = mize.packages.x86_64-linux.mizeFor.{system_str}.modules.{mod_name}.mizeBuildPhase;
+            mizeInstallPhase = mize.packages.x86_64-linux.mizeFor.{system_str}.modules.{mod_name}.mizeInstallPhase;
+        in mizeBuildPhase + mizeInstallPhase
+    "#, data.mize_flake);
+    std::env::set_var("MIZE_MODULE_NO_REPO", "1");
+    std::env::set_var("MIZE_MODULE_NO_EXTERNALS", "1");
+    std::env::set_var("MIZE_MODULE_PATH", src_path.to_str().unwrap());
+    let command = run_fun!(nix eval --impure --raw --expr $expr)?;
+
+    let buildable = Buildable {
+        name: name.to_owned(),
+        active: true,
+        config,
+        src_path,
+        command,
+    };
+
+    data.buildables.push(buildable);
 
     Ok(())
 }

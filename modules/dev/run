@@ -1,6 +1,6 @@
 set -e
 
-export MIZE_CONFIG=module_dir.dev=/home/me/work/modules/modules/dev/dist 
+export MIZE_CONFIG=module_dir.dev=/home/me/work/modules/modules/dev/dist
 
 function build_mize_dev() {
 
