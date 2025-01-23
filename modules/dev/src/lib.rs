@@ -47,6 +47,7 @@ pub struct DevModuleData {
     last_build: u32,
     mize_flake: String,
     buildables: Vec<Buildable>,
+    config: ItemData,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -95,7 +96,7 @@ impl mize::Module for DevModule {
                 )
                 .arg(Arg::new("config")
                     .help("the modName or build-config of the module")
-                    .required(false)
+                    //.required(true)
                 )
                 .arg(Arg::new("system")
                     .long("system")
@@ -104,9 +105,22 @@ impl mize::Module for DevModule {
                 )
             )
             .subcommand(
+                ClapCommand::new("remove")
+                .aliases(["rm", "r"])
+                .about("remove a module")
+                .arg(Arg::new("name")
+                    .help("the name of the module to build")
+                )
+            )
+            .subcommand(
                 ClapCommand::new("list")
-                .aliases(["ls"])
+                .aliases(["ls", "l"])
                 .about("list all modules/buildables in current dev env")
+            )
+            .subcommand(
+                ClapCommand::new("shell")
+                .aliases(["s"])
+                .about("run a shell instead of the tui")
             )
         ;
         let cmd: Vec<&str> = cmd_line.iter().map(|s|s.to_str().expect("")).collect();
@@ -115,9 +129,11 @@ impl mize::Module for DevModule {
 
         let res = match matches.subcommand() {
             Some(("add", sub_matches)) => cmd_add_buildable(self, instance, sub_matches),
+            Some(("remove", sub_matches)) => cmd_remove_buildable(self, instance, sub_matches),
             Some(("list", sub_matches)) => cmd_list_buildable(self, instance, sub_matches),
+            Some(("shell", sub_matches)) => enter_dev_env(self, instance, true),
             Some((cmd, _)) => { return Some(Err(mize_err!("unknown subcommand '{}'", cmd)));},
-            None => enter_dev_env(self, instance),
+            None => enter_dev_env(self, instance, false),
         };
 
         return Some(res);
@@ -126,7 +142,7 @@ impl mize::Module for DevModule {
 }
 
 
-fn enter_dev_env(dev_module: &mut DevModule, instance: &Instance) -> MizeResult<()> {
+fn enter_dev_env(dev_module: &mut DevModule, instance: &Instance, shell: bool) -> MizeResult<()> {
 
 
     ///////////////// read the mize_dev.json file
@@ -134,14 +150,54 @@ fn enter_dev_env(dev_module: &mut DevModule, instance: &Instance) -> MizeResult<
     let data = load_data(instance)?;
 
     ///////////////// spawn all dev shells for all ModuleToBuild
-    let dev_shells: Vec<Command> = Vec::new();
+    let mut dev_shells: Vec<Child> = Vec::new();
 
+    let host_system = run_fun!(nix eval --impure --expr "builtins.currentSystem")?;
 
+    ///////////////// spawn dev shell for all Buildables
+    for buildable in &data.buildables {
+        let target_system = buildable.config.get_path("system")
+            .map_err(|e| e.msg("The config of the Buildable does not have a system attribute"))?
+            .value_string()?;
 
-    ///////////////// spawn dev shell for all ModuleToBuild
+        let mod_name = buildable.config.get_path("modName")
+            .map_err(|e| e.msg("The config of the Buildable does not have a modName attribute"))?
+            .value_string()?;
+
+        //let dev_shell_path = format!("{}#packages.{}.mizeFor.{}.modules.{}.devShell", data.mize_flake, host_system, target_system, mod_name);
+        let dev_shell_path = format!("{}#packages.{}.mizeFor.{}.modules.{}.devShell", data.mize_flake, host_system, target_system, mod_name);
+        println!("dev_shell_path: {}", dev_shell_path);
+
+        let mut args = vec!["develop", "--impure", dev_shell_path.as_str()];
+
+        // add --override-input arg, when we have a config/override_nixpkgs set
+        if let Ok(nixpkgs_path) = data.config.get_path("override_nixpkgs")?.value_string() {
+            let arg = format!("--override-input nixpkgs {}", nixpkgs_path);
+            args.push(arg.as_str());
+        }
+
+        let child = Command::new("nix")
+            .arg("develop")
+            .arg("--impure")
+            .arg(dev_shell_path)
+            .env("MIZE_MODULE_NO_REPO", "1")
+            .env("MIZE_MODULE_NO_EXTERNALS", "1")
+            .env("MIZE_MODULE_PATH", &buildable.src_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?
+        ;
+        //let output = child.wait_with_output()?;
+        dev_shells.push(child);
+    }
 
     ///////////////// run the tui
-    tui::run_tui(data, instance);
+    if shell {
+        spawn_dev_shell()?;
+    } else {
+        tui::run_tui(data, instance);
+    }
 
     Ok(())
 }
@@ -152,6 +208,7 @@ impl Default for DevModuleData {
             last_build: 0,
             buildables: Vec::new(),
             mize_flake: "github:c2vi/mize".to_owned(),
+            config: ItemData::new(),
         }
     }
 }
@@ -174,7 +231,7 @@ pub fn load_data(instance: &Instance) -> MizeResult<DevModuleData> {
 pub fn store_data(instance: &Instance, data: DevModuleData) -> MizeResult<()> {
     let data_path = PathBuf::from(instance.get("0/config/store_path")?.value_string()?).join("mize_dev_data.json");
 
-    serde_json::to_writer(File::options().write(true).open(&data_path)?, &data)
+    serde_json::to_writer_pretty(File::options().write(true).open(&data_path)?, &data)
         .mize_result_msg("failed to encode DevModuleData into json with serde")?;
 
     Ok(())
@@ -206,9 +263,36 @@ pub fn cmd_add_buildable(module: &mut DevModule, instance: &Instance, sub_matche
     Ok(())
 }
 
+pub fn cmd_remove_buildable(module: &mut DevModule, instance: &Instance, sub_matches: &ArgMatches) -> MizeResult<()> {
+
+    let mut data = load_data(&instance)?;
+
+    let name: &String = sub_matches.get_one("name")
+        .ok_or(mize_err!("argument name not found"))?;
+
+    remove_buildable(&mut data, name)?;
+
+    store_data(&instance, data)?;
+
+    Ok(())
+}
+
 
 pub fn run_build(data: &DevModuleData, instance: &Instance) -> MizeResult<()> {
 
+    println!("hello world");
+    // write bash -c ''; huh.... what to do here???????
+
+
+    Ok(())
+}
+
+pub fn remove_buildable(data: &mut DevModuleData, name: &String) -> MizeResult<()> {
+
+    let index = &data.buildables.iter().position(|el| &el.name == name)
+        .ok_or(mize_err!("Buildable with name '{}' does not exist in current dev env", name))?;
+
+    data.buildables.remove(*index);
 
 
     Ok(())
@@ -219,6 +303,13 @@ pub fn add_buildable(data: &mut DevModuleData, sub_matches: &ArgMatches) -> Mize
     let name = sub_matches.get_one::<String>("name")
         .ok_or(mize_err!("no name argument"))?;
 
+    // check if this name already exists
+    for buildable in &data.buildables {
+        if name == &buildable.name {
+            return Err(mize_err!("A Buildable with the name '{}' already exists in this development environment", name));
+        }
+    }
+
     let src_path = PathBuf::from_str(
             sub_matches.get_one::<String>("src-path")
             .ok_or(mize_err!("no src-path argument"))?
@@ -227,9 +318,12 @@ pub fn add_buildable(data: &mut DevModuleData, sub_matches: &ArgMatches) -> Mize
 
     let config: ItemData = match sub_matches.get_one::<String>("config") {
         None => {
-            ItemData::new()
+            let mut config = ItemData::new();
+            config.set_path("system", "x86_64-linux-gnu")?;
+            config
             // TODO: get modName from the only module, which is in this folder... error if there
             // are multiple
+            // then set the config arg no longer required
         },
         Some(mut config_str) => {
             let mut tmp = String::new();
@@ -238,12 +332,17 @@ pub fn add_buildable(data: &mut DevModuleData, sub_matches: &ArgMatches) -> Mize
                 config_str = &tmp
             };
 
-            let config = data_from_string((*config_str).to_owned())?;
+            let mut config = data_from_string((*config_str).to_owned())?;
+
+            if let Err(_) = config.get_path("system")?.value_string() {
+                config.set_path("system", "x86_64-linux-gnu")?;
+            }
+
             config
         },
     };
 
-    let mod_name = config.get_path("config/modName")?.value_string()?;
+    let mod_name = config.get_path("modName")?.value_string()?;
     println!("config: {}", config);
     println!("modName: {}", mod_name);
 

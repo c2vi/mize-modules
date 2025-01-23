@@ -16,8 +16,9 @@ use ratatui::{
     },
     DefaultTerminal,
 };
+
 use crossterm::event::KeyModifiers;
-use std::process::Command;
+use std::{f32::consts::PI, process::Command};
 use mize::{error::IntoMizeResult, Instance, MizeResult};
 
 use crate::DevModuleData;
@@ -38,6 +39,7 @@ pub fn run_tui(data: DevModuleData, instance: &Instance) -> MizeResult<()> {
         data,
         dev_shells: Vec::new(),
         modules_state: ListState::default(),
+        build_status: "idle".to_string(),
     };
     let app_result = app.run(terminal);
     ratatui::restore();
@@ -50,7 +52,8 @@ struct App {
     should_exit: bool,
     data: DevModuleData,
     dev_shells: Vec<Command>,
-    modules_state: ListState
+    modules_state: ListState,
+    build_status: String,
 }
 
 
@@ -168,7 +171,7 @@ impl App {
     fn render_selected_item(&self, area: Rect, buf: &mut Buffer) {
         // We get the info depending on the item's state.
         //
-        let info = "module infoooooooooooooo".to_string();
+        let info = self.build_status;
 
         // We show the list item's info under the list in this paragraph
         let block = Block::new()

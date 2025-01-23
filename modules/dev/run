@@ -24,7 +24,7 @@ function build_mize_dev() {
 if [[ "$1" == "b" ]]
 then
   build_mize_dev
-  /home/me/work/mize/target/debug/mize dev
+  /home/me/work/mize/target/debug/mize dev "${@:2}"
 
 elif [[ "$1" == "bo" ]]
 then
