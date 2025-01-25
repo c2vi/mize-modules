@@ -21,7 +21,7 @@ use crossterm::event::KeyModifiers;
 use std::{f32::consts::PI, process::Command};
 use mize::{error::IntoMizeResult, Instance, MizeResult};
 
-use crate::DevModuleData;
+use crate::{DevModule, DevModuleData};
 
 const TODO_HEADER_STYLE: Style = Style::new().fg(SLATE.c100).bg(BLUE.c800);
 const NORMAL_ROW_BG: Color = SLATE.c950;
@@ -30,80 +30,19 @@ const SELECTED_STYLE: Style = Style::new().bg(SLATE.c800).add_modifier(Modifier:
 const TEXT_FG_COLOR: Color = SLATE.c200;
 const COMPLETED_TEXT_FG_COLOR: Color = GREEN.c500;
 
-pub fn run_tui(data: DevModuleData, instance: &Instance) -> MizeResult<()> {
-    color_eyre::install()?;
-    let terminal = ratatui::init();
-    let app = App {
-        instance: instance.clone(),
-        should_exit: false,
-        data,
-        dev_shells: Vec::new(),
-        modules_state: ListState::default(),
-        build_status: "idle".to_string(),
-    };
-    let app_result = app.run(terminal);
-    ratatui::restore();
-    app_result
-}
 
-
-struct App {
-    instance: Instance,
-    should_exit: bool,
-    data: DevModuleData,
-    dev_shells: Vec<Command>,
+pub struct TuiState {
     modules_state: ListState,
     build_status: String,
 }
 
-
-impl App {
-    fn run(mut self, mut terminal: DefaultTerminal) -> MizeResult<()> {
-        while !self.should_exit {
-
-            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
-
-            if let Event::Key(key) = event::read()? {
-                self.handle_key(key)?;
-            };
-        }
-        Ok(())
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> MizeResult<()> {
-        if key.kind != KeyEventKind::Press {
-            return Ok(());
-        }
-
-        // CTRL+c should also exit
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            self.should_exit = true
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_exit = true,
-
-            KeyCode::Char('j') | KeyCode::Down => self.modules_state.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => self.modules_state.select_previous(),
-            KeyCode::Char('g') | KeyCode::Home => self.modules_state.select_first(),
-            KeyCode::Char('G') | KeyCode::End => self.modules_state.select_last(),
-
-            KeyCode::Char('r') | KeyCode::End => crate::run_build(&self.data, &self.instance)?,
-
-            // TODO: KeyCode::Char('a') | KeyCode::End => tui_add_buildable(&mut self.data),
-            _ => {}
-        };
-
-        Ok(())
-    }
-
-    /// Changes the status of the selected list item
-    fn toggle_status(&mut self) {
-        println!("toggling status..................");
-    }
+pub struct Tui<'a> {
+    should_exit: bool,
+    dev_module: &'a mut DevModule,
 }
 
-impl Widget for &mut App {
+
+impl Widget for &mut Tui<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let [header_area, main_area, footer_area] = Layout::vertical([
             Constraint::Length(2),
@@ -134,7 +73,87 @@ impl Widget for &mut App {
 }
 
 /// Rendering logic for the app
-impl App {
+impl Tui<'_> {
+
+    pub fn new(dev_module: &mut DevModule) -> MizeResult<Tui<'_>> {
+        Ok(Tui {
+            should_exit: false, 
+            dev_module,
+        })
+    }
+
+    pub fn state(&mut self) -> &mut TuiState {
+        self.dev_module.tui_state()
+    }
+
+
+    pub fn init_state(dev_module: &mut DevModule) {
+
+        // if there is no tui state, initialize it
+        if dev_module.tui_state.is_none() {
+            dev_module.tui_state = Some( TuiState {
+                modules_state: ListState::default(),
+                build_status: "idle".to_string(),
+            });
+        }
+    }
+
+
+    pub fn run(&mut self) -> MizeResult<()> {
+        // start ratatui
+        color_eyre::install()?;
+        let mut terminal = ratatui::init();
+
+        // event loop
+        while !self.should_exit {
+
+            terminal.draw(|frame| frame.render_widget(&mut *self, frame.area()))?;
+
+            if let Event::Key(key) = event::read()? {
+                self.handle_key(key)?;
+            };
+        }
+
+        // restore terminal
+        ratatui::restore();
+
+
+        Ok(())
+    }
+
+
+    /// Changes the status of the selected list item
+    fn toggle_status(&mut self) {
+        println!("toggling status..................");
+    }
+
+
+    fn handle_key(&mut self, key: KeyEvent) -> MizeResult<()> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        // CTRL+c should also exit
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            self.should_exit = true
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_exit = true,
+
+            KeyCode::Char('j') | KeyCode::Down => self.state().modules_state.select_next(),
+            KeyCode::Char('k') | KeyCode::Up => self.state().modules_state.select_previous(),
+            KeyCode::Char('g') | KeyCode::Home => self.state().modules_state.select_first(),
+            KeyCode::Char('G') | KeyCode::End => self.state().modules_state.select_last(),
+
+            KeyCode::Char('r') | KeyCode::End => self.dev_module.run_build()?,
+
+            // TODO: KeyCode::Char('a') | KeyCode::End => tui_add_buildable(&mut self.data),
+            _ => {}
+        };
+
+        Ok(())
+    }
 
     fn render_list(&mut self, area: Rect, buf: &mut Buffer) {
         let block = Block::new()
@@ -146,7 +165,7 @@ impl App {
 
         // Iterate through all elements in the `items` and stylize them.
         let items: Vec<ListItem> = self
-            .data
+            .dev_module.data
             .buildables
             .iter()
             .enumerate()
@@ -165,13 +184,13 @@ impl App {
 
         // We need to disambiguate this trait method as both `Widget` and `StatefulWidget` share the
         // same method name `render`.
-        StatefulWidget::render(list, area, buf, &mut self.modules_state);
+        StatefulWidget::render(list, area, buf, &mut self.state().modules_state);
     }
 
-    fn render_selected_item(&self, area: Rect, buf: &mut Buffer) {
+    fn render_selected_item(&mut self, area: Rect, buf: &mut Buffer) {
         // We get the info depending on the item's state.
         //
-        let info = self.build_status;
+        let info = self.state().build_status.clone();
 
         // We show the list item's info under the list in this paragraph
         let block = Block::new()
