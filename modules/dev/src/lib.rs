@@ -8,9 +8,12 @@ use std::fs;
 use std::fs::File;
 use std::io::stdout;
 use std::io::Stdin;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
+use std::io::{ BufRead, BufReader };
+use std::sync::atomic::AtomicBool;
 use clap::Command as ClapCommand;
 use mize::error::IntoMizeResult;
 use mize::item::data_from_string;
@@ -48,9 +51,18 @@ pub struct DevModuleMutexed {
 
 pub struct DevModule {
     dev_shells: HashMap<String, Child>,
+    outputs: HashMap<String, Arc<Mutex<Vec<String>>>>,
+    state: HashMap<String, String>,
     data: DevModuleData,
     instance: Instance,
     tui_state: Option<TuiState>,
+    event_rx: flume::Receiver<DevModuleEvent>,
+    event_tx: flume::Sender<DevModuleEvent>,
+}
+
+pub enum DevModuleEvent {
+    Term(crossterm::event::Event),
+    BuildFinished(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,11 +121,16 @@ impl mize::Module for DevModuleMutexed {
 
 impl DevModule {
     pub fn new(instance: Instance) -> DevModule {
+        let (tx, rx) = flume::unbounded();
         DevModule {
             data: DevModuleData::default(),
             dev_shells: HashMap::new(),
+            outputs: HashMap::new(),
+            state: HashMap::new(),
             instance,
             tui_state: None,
+            event_rx: rx,
+            event_tx: tx,
         }
     }
 
@@ -207,10 +224,16 @@ impl DevModule {
 
     fn run_tui(&mut self) -> MizeResult<()> {
 
+        self.load_data()?;
+
+        self.start_dev_shells()?;
+
         let mut tui = tui::Tui::new(self)?;
 
         tui.run()?;
         
+        self.store_data()?;
+
         Ok(())
     }
 
@@ -237,8 +260,8 @@ impl DevModule {
             let mut args = vec!["develop", "--impure", dev_shell_path.as_str()];
 
             // add --override-input arg, when we have a config/override_nixpkgs set
-            if let Ok(nixpkgs_path) = self.data.config.get_path("override_nixpkgs")?.value_string() {
-                let arg = format!("--override-input nixpkgs {}", nixpkgs_path);
+            if let Ok(nixpkgs_path) = self.data.config.get_path("override_nixpkgs") {
+                let arg = format!("--override-input nixpkgs {}", nixpkgs_path.value_string()?);
                 args.push(arg.as_str());
             }
 
@@ -262,15 +285,16 @@ impl DevModule {
     }
 
     pub fn load_data(&mut self) -> MizeResult<()> {
-        let data_path = PathBuf::from(self.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_data.json");
+        let data_path = PathBuf::from(self.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module").join("data.json");
         println!("data_path: {}", data_path.display());
 
         if !data_path.exists() {
+            fs::create_dir_all(data_path.as_path().parent().ok_or(mize_err!(""))?)?;
             let string = serde_json::to_string(&DevModuleData::default())?;
             fs::write(&data_path, string);
         };
         self.data = serde_json::from_reader(File::open(&data_path)?)
-            .map_err(|e| mize_err!("Failed to read mize dev module's data from mize_store_dir/mize_dev_data.json: {e}"))?;
+            .map_err(|e| mize_err!("Failed to read mize dev module's data from mize_store_dir/mize_dev_module/data.json: {e}"))?;
 
         Ok(())
 
@@ -278,7 +302,7 @@ impl DevModule {
 
 
     pub fn store_data(&self) -> MizeResult<()> {
-        let data_path = PathBuf::from(self.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_data.json");
+        let data_path = PathBuf::from(self.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module").join("data.json");
 
         serde_json::to_writer_pretty(File::options().write(true).open(&data_path)?, &self.data)
             .mize_result_msg("failed to encode DevModuleData into json with serde")?;
@@ -358,9 +382,120 @@ impl DevModule {
 
 
     pub fn run_build(&mut self) -> MizeResult<()> {
+        // this is not a clean implementation
+        // eventually the dev_shell should be a running mize instance also having the module loaded
+        // all sync and state will then be done via mize itself
 
-        println!("hello world");
-        // write bash -c ''; huh.... what to do here???????
+
+
+        // initialize or clear all outputs
+        for buildabel in &self.data.buildables {
+            match self.outputs.get(&buildabel.name) {
+                Some(out) => {
+                    let mut val = out.lock()?;
+                    *val = Vec::new();
+                },
+                None => {
+                    let val = Arc::new(Mutex::new(Vec::new()));
+                    self.outputs.insert(buildabel.name.clone(), val);
+                },
+            }
+        };
+
+
+        for buildabel in &self.data.buildables {
+
+            let child = self.dev_shells.get_mut(&buildabel.name)
+                .ok_or(mize_err!("Trying to build module, which has no active dev_shell"))?;
+
+            let mut stdin = child.stdin.take().ok_or(mize_err!("dev_shell process of buildable '{}' had no stdin", buildabel.name))?;
+            let mut stdout = BufReader::new(child.stdout.take().ok_or(mize_err!("dev_shell process of buildable '{}' had no stdout", buildabel.name))?);
+            let mut stderr = BufReader::new(child.stderr.take().ok_or(mize_err!("dev_shell process of buildable '{}' had no stderr", buildabel.name))?);
+
+            let command = format!("bash -c 'echo $$; echo running command: {}; echo;  {}' \n", buildabel.command, buildabel.command);
+
+            let output_arc_one = self.outputs.get(&buildabel.name).unwrap().clone();
+            let output_arc_two = self.outputs.get(&buildabel.name).unwrap().clone();
+
+            let cancel_output_thread_one = Arc::new(AtomicBool::new(false));
+            let cancel_output_thread_two = cancel_output_thread_one.clone();
+            let cancel_output_thread_three = cancel_output_thread_one.clone();
+
+            let event_tx = self.event_tx.clone();
+            let name_clone = buildabel.name.clone();
+
+            println!("command: {}",  command);
+
+            // write bash -c  to stdin of shell
+            stdin.write_all(command.as_bytes());
+
+            println!("hereeeeeeeeeeeeeeee two");
+
+            // read first line of output
+            let mut pid_string = String::new();
+            stdout.read_line(&mut pid_string)?;
+            pid_string.pop(); // remove \n in the end
+
+            println!("hereeeeeeeeeeeeeeee three");
+
+            let mut output = output_arc_two.lock()?;
+            output.push(format!("running with PID: {}", pid_string));
+            drop(output);
+
+            let pid: i32 = pid_string.parse()?;
+            println!("pid: {}", pid);
+
+            println!("hereeeeeeeeeeeeeeee four");
+
+            // spawn thread, which reads the rest into self.outputs
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+
+                while !cancel_output_thread_one.load(std::sync::atomic::Ordering::Acquire) {
+                    buf.clear();
+
+                    stdout.read_line(&mut buf);
+
+                    let mut output = match output_arc_one.lock() {
+                        Ok(val) => val,
+                        Err(e) => { 
+                            println!("can't lock output_arc_one: {}", e);
+                            return;
+                        },
+                    };
+                    output.push(buf.clone());
+                }
+            });
+
+            // thread to read the stderr at the same time
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+
+                while !cancel_output_thread_two.load(std::sync::atomic::Ordering::Acquire) {
+                    buf.clear();
+
+                    stderr.read_line(&mut buf);
+
+                    let mut output = match output_arc_two.lock() {
+                        Ok(val) => val,
+                        Err(e) => { 
+                            println!("can't lock output_arc_two: {}", e);
+                            return;
+                        },
+                    };
+                    output.push(buf.clone());
+                }
+            });
+          
+            // spawn thread, which waits for process by id to cancel and then sends an BuildFinished event
+            // and tells the output writing thread to exit
+            std::thread::spawn(move || {
+                let mut handle = waitpid_any::WaitHandle::open(pid).unwrap();
+                handle.wait().unwrap();
+                cancel_output_thread_three.store(true, std::sync::atomic::Ordering::Relaxed);
+                event_tx.send(DevModuleEvent::BuildFinished(name_clone));
+            });
+        }
 
 
         Ok(())

@@ -16,12 +16,17 @@ use ratatui::{
     },
     DefaultTerminal,
 };
+use std::{fs, os::unix::thread::JoinHandleExt, sync::atomic::Ordering, thread};
 
 use crossterm::event::KeyModifiers;
 use std::{f32::consts::PI, process::Command};
+use std::path::PathBuf;
+use std::time::Duration;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use mize::{error::IntoMizeResult, Instance, MizeResult};
 
-use crate::{DevModule, DevModuleData};
+use crate::{DevModule, DevModuleData, DevModuleEvent};
 
 const TODO_HEADER_STYLE: Style = Style::new().fg(SLATE.c100).bg(BLUE.c800);
 const NORMAL_ROW_BG: Color = SLATE.c950;
@@ -104,18 +109,55 @@ impl Tui<'_> {
         color_eyre::install()?;
         let mut terminal = ratatui::init();
 
+        // like this the run method can only be called once in the lifetime of the whole programm
+        // not even unloading the module would reset this thread....
+        let tx = self.dev_module.event_tx.clone();
+        let cancel_thread_one = Arc::new(AtomicBool::new(false));
+        let cancel_thread_two = cancel_thread_one.clone();
+        let handle = std::thread::spawn(move || {
+            while !cancel_thread_two.load(Ordering::Acquire) {
+                if event::poll(Duration::from_millis(250)).unwrap() {
+                    let event = match event::read() {
+                        Ok(val) => val,
+                        Err(e) => continue,
+                    };
+                    if let Err(e) = tx.send(DevModuleEvent::Term(event)) {
+                        println!("error sending Term event");
+                    };
+                }
+            }
+        });
+
         // event loop
         while !self.should_exit {
 
             terminal.draw(|frame| frame.render_widget(&mut *self, frame.area()))?;
 
-            if let Event::Key(key) = event::read()? {
-                self.handle_key(key)?;
-            };
+            match self.dev_module.event_rx.recv()? {
+
+                DevModuleEvent::Term(ev) => {
+                    match ev {
+                        Event::Key(key_event) => self.handle_key(key_event)?,
+                        _ => continue,
+                    }
+                },
+
+                DevModuleEvent::BuildFinished(name) => {
+                    println!("build finished: {}", name);
+
+                    let dir_path = PathBuf::from(self.dev_module.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module");
+                    let output = self.dev_module.outputs.get(&name).unwrap().lock()?;
+                    fs::write(dir_path.as_path().join(format!("{}.log", name)), output.join("\n"))?;
+                },
+            }
+
         }
 
         // restore terminal
         ratatui::restore();
+
+        cancel_thread_one.store(true, Ordering::Relaxed);
+        
 
 
         Ok(())
@@ -146,7 +188,11 @@ impl Tui<'_> {
             KeyCode::Char('g') | KeyCode::Home => self.state().modules_state.select_first(),
             KeyCode::Char('G') | KeyCode::End => self.state().modules_state.select_last(),
 
-            KeyCode::Char('r') | KeyCode::End => self.dev_module.run_build()?,
+            KeyCode::Char('r') | KeyCode::End => {
+                thread::spawn(|| {
+                });
+                self.dev_module.run_build()?
+            },
 
             // TODO: KeyCode::Char('a') | KeyCode::End => tui_add_buildable(&mut self.data),
             _ => {}
