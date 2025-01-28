@@ -24,7 +24,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use mize::{error::IntoMizeResult, Instance, MizeResult};
+use mize::{error::IntoMizeResult, mize_err, Instance, MizeResult};
+use std::fs::OpenOptions;
+use std::io::Write;
+use mize::MizeError;
 
 use crate::{DevModule, DevModuleData, DevModuleEvent};
 
@@ -128,10 +131,13 @@ impl Tui<'_> {
             }
         });
 
+        let dir_path = PathBuf::from(self.dev_module.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module");
+
         // event loop
         while !self.should_exit {
 
             terminal.draw(|frame| frame.render_widget(&mut *self, frame.area()))?;
+
 
             match self.dev_module.event_rx.recv()? {
 
@@ -143,12 +149,26 @@ impl Tui<'_> {
                 },
 
                 DevModuleEvent::BuildFinished(name) => {
-                    println!("build finished: {}", name);
-
-                    let dir_path = PathBuf::from(self.dev_module.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module");
-                    let output = self.dev_module.outputs.get(&name).unwrap().lock()?;
-                    fs::write(dir_path.as_path().join(format!("{}.log", name)), output.join("\n"))?;
+                    match self.dev_module.state.get_mut(&name) {
+                        None => {
+                            self.dev_module.state.insert(name.clone(), "idle".to_owned());
+                        },
+                        Some(state) => {
+                            *state = "idle".to_owned();
+                        },
+                    };
                 },
+
+                DevModuleEvent::BuildOutput((name, line)) => {
+                    self.dev_module.outputs.get_mut(&name).ok_or(mize_err!("..."))?.push(line.clone());
+                    let mut file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .append(true)
+                        .open(dir_path.as_path().join(format!("{}.log", name)))?;
+                    write!(file, "{}", line);
+                    //println!("output from {}: {}", name, line);
+                }
             }
 
         }
@@ -217,7 +237,9 @@ impl Tui<'_> {
             .enumerate()
             .map(|(i, buildable)| {
                 let color = alternate_colors(i);
-                ListItem::new(buildable.name.clone()).bg(color)
+                let default_status = "idle".to_owned();
+                let status = self.dev_module.state.get(&buildable.name).unwrap_or(&default_status);
+                ListItem::new(format!("{}\t status: {}", buildable.name, status)).bg(color)
             })
             .collect();
 
@@ -235,8 +257,17 @@ impl Tui<'_> {
 
     fn render_selected_item(&mut self, area: Rect, buf: &mut Buffer) {
         // We get the info depending on the item's state.
-        //
-        let info = self.state().build_status.clone();
+        
+
+        let info = match self.state().modules_state.selected() {
+            None => "No Module selected".to_string(),
+            Some(index) => {
+                let buildable_name = self.dev_module.data.buildables.iter().nth(index).unwrap().name.clone();
+                let default_output = Vec::new();
+                let output = self.dev_module.outputs.get(&buildable_name).unwrap_or(&default_output);
+                output.join("")
+            },
+        };
 
         // We show the list item's info under the list in this paragraph
         let block = Block::new()

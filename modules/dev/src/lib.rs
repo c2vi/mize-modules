@@ -7,10 +7,14 @@ use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io::stdout;
+use std::io::Read;
 use std::io::Stdin;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Child;
+use std::process::ChildStderr;
+use std::process::ChildStdin;
+use std::process::ChildStdout;
 use std::process::Command;
 use std::io::{ BufRead, BufReader };
 use std::sync::atomic::AtomicBool;
@@ -48,10 +52,16 @@ pub struct DevModuleMutexed {
     inner: Arc<Mutex<DevModule>>,
 }
 
+struct MyChild {
+    child: Child,
+    stdin: Arc<Mutex<ChildStdin>>,
+    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
+    stderr: Arc<Mutex<BufReader<ChildStderr>>>,
+}
 
 pub struct DevModule {
-    dev_shells: HashMap<String, Child>,
-    outputs: HashMap<String, Arc<Mutex<Vec<String>>>>,
+    dev_shells: HashMap<String, MyChild>,
+    outputs: HashMap<String, Vec<String>>,
     state: HashMap<String, String>,
     data: DevModuleData,
     instance: Instance,
@@ -63,6 +73,7 @@ pub struct DevModule {
 pub enum DevModuleEvent {
     Term(crossterm::event::Event),
     BuildFinished(String),
+    BuildOutput((String, String))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,7 +276,7 @@ impl DevModule {
                 args.push(arg.as_str());
             }
 
-            let child = Command::new("nix")
+            let mut child = Command::new("nix")
                 .arg("develop")
                 .arg("--impure")
                 .arg(dev_shell_path)
@@ -277,8 +288,15 @@ impl DevModule {
                 .stderr(Stdio::piped())
                 .spawn()?
             ;
-            //let output = child.wait_with_output()?;
-            self.dev_shells.insert(buildable.name.clone(), child);
+
+            let my_child = MyChild {
+                stdin: Arc::new(Mutex::new(child.stdin.take().unwrap())),
+                stdout: Arc::new(Mutex::new(BufReader::new(child.stdout.take().unwrap()))),
+                stderr: Arc::new(Mutex::new(BufReader::new(child.stderr.take().unwrap()))),
+                child,
+            };
+
+            self.dev_shells.insert(buildable.name.clone(), my_child);
         }
 
         Ok(())
@@ -387,113 +405,95 @@ impl DevModule {
         // all sync and state will then be done via mize itself
 
 
-
         // initialize or clear all outputs
-        for buildabel in &self.data.buildables {
-            match self.outputs.get(&buildabel.name) {
-                Some(out) => {
-                    let mut val = out.lock()?;
+        for buildable in &self.data.buildables {
+            match self.outputs.get_mut(&buildable.name) {
+                Some(val) => {
                     *val = Vec::new();
                 },
                 None => {
-                    let val = Arc::new(Mutex::new(Vec::new()));
-                    self.outputs.insert(buildabel.name.clone(), val);
+                    let val = Vec::new();
+                    self.outputs.insert(buildable.name.clone(), val);
                 },
             }
         };
 
 
-        for buildabel in &self.data.buildables {
+        // set all statuses to "building"
+        for buildable in &self.data.buildables {
+            match self.state.get_mut(&buildable.name) {
+                Some(val) => {
+                    *val = "building".to_owned();
+                },
+                None => {
+                    self.state.insert(buildable.name.clone(), "building".to_owned());
+                },
+            }
+        };
 
-            let child = self.dev_shells.get_mut(&buildabel.name)
-                .ok_or(mize_err!("Trying to build module, which has no active dev_shell"))?;
 
-            let mut stdin = child.stdin.take().ok_or(mize_err!("dev_shell process of buildable '{}' had no stdin", buildabel.name))?;
-            let mut stdout = BufReader::new(child.stdout.take().ok_or(mize_err!("dev_shell process of buildable '{}' had no stdout", buildabel.name))?);
-            let mut stderr = BufReader::new(child.stderr.take().ok_or(mize_err!("dev_shell process of buildable '{}' had no stderr", buildabel.name))?);
+        for buildable in &self.data.buildables {
 
-            let command = format!("bash -c 'echo $$; echo running command: {}; echo;  {}' \n", buildabel.command, buildabel.command);
-
-            let output_arc_one = self.outputs.get(&buildabel.name).unwrap().clone();
-            let output_arc_two = self.outputs.get(&buildabel.name).unwrap().clone();
+            // we redirect all output from the command we spawn to stderr and stdout only gets the
+            // pid from the prepended echo $$ command
+            // like this we only need to capture output from stderr and only read_line() the pid
+            // from stdout
+            let command = format!("bash -c 'echo $$; {} >2'\n", buildable.command);
 
             let cancel_output_thread_one = Arc::new(AtomicBool::new(false));
             let cancel_output_thread_two = cancel_output_thread_one.clone();
             let cancel_output_thread_three = cancel_output_thread_one.clone();
 
-            let event_tx = self.event_tx.clone();
-            let name_clone = buildabel.name.clone();
-
-            println!("command: {}",  command);
+            //println!("command: {}",  command);
 
             // write bash -c  to stdin of shell
+            let mut stdin = self.dev_shells.get(&buildable.name).unwrap().stdin.lock()?;
+
+            //let mut tmp = Vec::new();
+            //stdout.buffer().
             stdin.write_all(command.as_bytes());
+            drop(stdin);
 
-            println!("hereeeeeeeeeeeeeeee two");
 
-            // read first line of output
+            let mut stdout = self.dev_shells.get(&buildable.name).unwrap().stdout.lock()?;
             let mut pid_string = String::new();
             stdout.read_line(&mut pid_string)?;
-            pid_string.pop(); // remove \n in the end
-
-            println!("hereeeeeeeeeeeeeeee three");
-
-            let mut output = output_arc_two.lock()?;
-            output.push(format!("running with PID: {}", pid_string));
-            drop(output);
-
+            pid_string.pop();
             let pid: i32 = pid_string.parse()?;
-            println!("pid: {}", pid);
 
-            println!("hereeeeeeeeeeeeeeee four");
+            //println!("pid: {}", pid);
 
-            // spawn thread, which reads the rest into self.outputs
-            std::thread::spawn(move || {
-                let mut buf = String::new();
+            drop(stdout);
 
-                while !cancel_output_thread_one.load(std::sync::atomic::Ordering::Acquire) {
-                    buf.clear();
-
-                    stdout.read_line(&mut buf);
-
-                    let mut output = match output_arc_one.lock() {
-                        Ok(val) => val,
-                        Err(e) => { 
-                            println!("can't lock output_arc_one: {}", e);
-                            return;
-                        },
-                    };
-                    output.push(buf.clone());
-                }
-            });
+            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), "############## NEW BUILD ##############\n".to_owned())))?;
 
             // thread to read the stderr at the same time
+            let stderr_clone = self.dev_shells.get(&buildable.name).unwrap().stderr.clone();
+            let event_tx_clone = self.event_tx.clone();
+            let name_clone = buildable.name.clone();
             std::thread::spawn(move || {
                 let mut buf = String::new();
+
+                let mut stderr = stderr_clone.lock().unwrap();
 
                 while !cancel_output_thread_two.load(std::sync::atomic::Ordering::Acquire) {
                     buf.clear();
 
                     stderr.read_line(&mut buf);
 
-                    let mut output = match output_arc_two.lock() {
-                        Ok(val) => val,
-                        Err(e) => { 
-                            println!("can't lock output_arc_two: {}", e);
-                            return;
-                        },
-                    };
-                    output.push(buf.clone());
+                    event_tx_clone.send(DevModuleEvent::BuildOutput((name_clone.clone(), buf.clone())));
                 }
             });
           
             // spawn thread, which waits for process by id to cancel and then sends an BuildFinished event
             // and tells the output writing thread to exit
+            let event_tx_clone = self.event_tx.clone();
+            let name_clone = buildable.name.clone();
             std::thread::spawn(move || {
                 let mut handle = waitpid_any::WaitHandle::open(pid).unwrap();
                 handle.wait().unwrap();
                 cancel_output_thread_three.store(true, std::sync::atomic::Ordering::Relaxed);
-                event_tx.send(DevModuleEvent::BuildFinished(name_clone));
+                event_tx_clone.send(DevModuleEvent::BuildFinished(name_clone));
             });
         }
 
