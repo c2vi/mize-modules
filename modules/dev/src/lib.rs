@@ -186,6 +186,14 @@ impl DevModule {
                 .aliases(["s"])
                 .about("run a shell instead of the tui")
             )
+            .subcommand(
+                ClapCommand::new("print")
+                .aliases(["p"])
+                .about("print info about a buildable")
+                .arg(Arg::new("name")
+                    .help("the name of the module to print info about")
+                )
+            )
         ;
         let cmd: Vec<&str> = cmd_line.iter().map(|s|s.to_str().expect("")).collect();
         println!("cmdline: {:?}", cmd);
@@ -197,6 +205,7 @@ impl DevModule {
             Some(("list", sub_matches)) => self.cmd_list_buildable(sub_matches)?,
 
             Some(("shell", sub_matches)) => self.run_shell()?,
+            Some(("print", sub_matches)) => self.cmd_print_buildable(sub_matches)?,
             Some((cmd, _)) => { return Err(mize_err!("unknown subcommand '{}'", cmd));},
             None => self.run_tui()?,
         };
@@ -324,6 +333,30 @@ impl DevModule {
 
         serde_json::to_writer_pretty(File::options().write(true).open(&data_path)?, &self.data)
             .mize_result_msg("failed to encode DevModuleData into json with serde")?;
+
+        Ok(())
+    }
+
+
+    pub fn cmd_print_buildable(&mut self, sub_matches: &ArgMatches) -> MizeResult<()> {
+        self.load_data()?;
+
+        let name = sub_matches.get_one::<String>("name")
+            .ok_or(mize_err!("no name argument"))?;
+
+        let buildable = self.data.buildables.iter().find(|b| &b.name == name)
+            .ok_or(mize_err!("no buildable with name '{}' found in current dev environment", name))?;
+
+        println!("name: {}", name);
+
+        println!("active: {}", buildable.active);
+
+        println!("src_path: {}", buildable.src_path.display());
+
+        println!("\nconfig: \n{}\n", buildable.config);
+
+        println!("command: \n{}", buildable.command);
+
 
         Ok(())
     }
