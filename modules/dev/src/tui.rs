@@ -1,7 +1,11 @@
 
 use color_eyre::Result;
+use ratatui::widgets::Cell;
+use ratatui::widgets::Table;
+use ratatui::widgets::Row;
+use ratatui::widgets::TableState;
 use ratatui::{
-    buffer::Buffer,
+    buffer::{Buffer},
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     layout::{Constraint, Layout, Rect},
     style::{
@@ -40,7 +44,7 @@ const COMPLETED_TEXT_FG_COLOR: Color = GREEN.c500;
 
 
 pub struct TuiState {
-    modules_state: ListState,
+    modules_state: TableState,
     build_status: String,
 }
 
@@ -100,7 +104,7 @@ impl Tui<'_> {
         // if there is no tui state, initialize it
         if dev_module.tui_state.is_none() {
             dev_module.tui_state = Some( TuiState {
-                modules_state: ListState::default(),
+                modules_state: TableState::default(),
                 build_status: "idle".to_string(),
             });
         }
@@ -222,6 +226,7 @@ impl Tui<'_> {
     }
 
     fn render_list(&mut self, area: Rect, buf: &mut Buffer) {
+
         let block = Block::new()
             .title(Line::raw("Modules").centered())
             .borders(Borders::TOP)
@@ -230,7 +235,7 @@ impl Tui<'_> {
             .bg(NORMAL_ROW_BG);
 
         // Iterate through all elements in the `items` and stylize them.
-        let items: Vec<ListItem> = self
+        let items: Vec<Row> = self
             .dev_module.data
             .buildables
             .iter()
@@ -239,12 +244,23 @@ impl Tui<'_> {
                 let color = alternate_colors(i);
                 let default_status = "idle".to_owned();
                 let status = self.dev_module.state.get(&buildable.name).unwrap_or(&default_status);
-                ListItem::new(format!("{}\t status: {}", buildable.name, status)).bg(color)
+                let active = true;
+                let active_string = match active {
+                    true => "active".to_owned(),
+                    false => "deactivated".to_owned(),
+                };
+
+                Row::new([Cell::from(buildable.name.clone()), Cell::from(status.clone()), Cell::from(active_string)]).bg(color)
             })
             .collect();
 
-        // Create a List from all list items and highlight the currently selected one
-        let list = List::new(items)
+        let widths = [
+            Constraint::Ratio(1, 1),
+            Constraint::Ratio(1, 1),
+            Constraint::Ratio(1, 1),
+        ];
+
+        let table = Table::new(items, widths)
             .block(block)
             .highlight_style(SELECTED_STYLE)
             .highlight_symbol(">")
@@ -252,7 +268,7 @@ impl Tui<'_> {
 
         // We need to disambiguate this trait method as both `Widget` and `StatefulWidget` share the
         // same method name `render`.
-        StatefulWidget::render(list, area, buf, &mut self.state().modules_state);
+        StatefulWidget::render(table, area, buf, &mut self.state().modules_state);
     }
 
     fn render_selected_item(&mut self, area: Rect, buf: &mut Buffer) {
