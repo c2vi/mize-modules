@@ -18,7 +18,12 @@ use std::process::ChildStdout;
 use std::process::Command;
 use std::io::{ BufRead, BufReader };
 use std::sync::atomic::AtomicBool;
+use std::thread;
 use clap::Command as ClapCommand;
+use cmd_lib::run_cmd;
+use crossterm::event;
+use flume::Sender;
+use libc::dev_t;
 use mize::error::IntoMizeResult;
 use mize::item::data_from_string;
 use tui::TuiState;
@@ -214,6 +219,14 @@ impl DevModule {
     }
 
 
+    fn tui_state(&mut self) -> &mut TuiState {
+
+        Tui::init_state(self);
+
+        return self.tui_state.as_mut().unwrap();
+    }
+
+
     fn run_shell(&mut self) -> MizeResult<()> {
 
         ///////////////// spawn the shell to run commands from
@@ -234,17 +247,12 @@ impl DevModule {
     }
 
 
-    fn tui_state(&mut self) -> &mut TuiState {
-
-        Tui::init_state(self);
-
-        return self.tui_state.as_mut().unwrap();
-    }
-
 
     fn run_tui(&mut self) -> MizeResult<()> {
 
         self.load_data()?;
+
+        self.start_pipe_listening_thread()?;
 
         self.start_dev_shells()?;
 
@@ -253,6 +261,36 @@ impl DevModule {
         tui.run()?;
         
         self.store_data()?;
+
+        Ok(())
+    }
+
+    fn start_pipe_listening_thread(&mut self) -> MizeResult<()> {
+
+        let pipe_path = PathBuf::from(self.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module").join("pipe");
+        if !pipe_path.exists() {
+            run_cmd!("mkfifo" "$pipe_path")?;
+        }
+
+        let pipe = BufReader::new(File::open(pipe_path)?);
+        let mut instance_clone = self.instance.clone();
+        let event_tx_clone = self.event_tx.clone();
+        self.instance.spawn("dev_module_pipe_listener", move || {
+            for line in pipe.lines() {
+                match line {
+                    Ok(line) => {
+                        if let Err(e) = handle_line(event_tx_clone.clone(), &mut instance_clone, line) {
+                            instance_clone.report_err(e);
+                        }
+                    },
+                    Err(e) => {
+                        instance_clone.report_err(<std::io::Error as Into<MizeError>>::into(e).msg("couldn't read line from dev module pipe"));
+                    }
+                }
+
+            }
+            Ok(())
+        });
 
         Ok(())
     }
@@ -273,28 +311,33 @@ impl DevModule {
                 .map_err(|e| e.msg("The config of the Buildable does not have a modName attribute"))?
                 .value_string()?;
 
+            println!("self.data.mize_flake: {}", self.data.mize_flake);
+
             //let dev_shell_path = format!("{}#packages.{}.mizeFor.{}.modules.{}.devShell", data.mize_flake, host_system, target_system, mod_name);
             let dev_shell_path = format!("{}#packages.{}.mizeFor.{}.modules.{}.devShell", self.data.mize_flake, host_system, target_system, mod_name);
             println!("dev_shell_path: {}", dev_shell_path);
 
-            let mut args = vec!["develop", "--impure", dev_shell_path.as_str()];
+            let mut args = vec!["develop".to_owned(), "--impure".to_owned(), dev_shell_path];
 
             // add --override-input arg, when we have a config/override_nixpkgs set
             if let Ok(nixpkgs_path) = self.data.config.get_path("override_nixpkgs") {
                 let arg = format!("--override-input nixpkgs {}", nixpkgs_path.value_string()?);
-                args.push(arg.as_str());
+                args.push(arg);
             }
 
+            // 
+            args.push("-c".to_owned());
+            args.push("bash".to_owned());
+            args.push("-i".to_owned());
+
             let mut child = Command::new("nix")
-                .arg("develop")
-                .arg("--impure")
-                .arg(dev_shell_path)
+                .args(args)
                 .env("MIZE_MODULE_NO_REPO", "1")
                 .env("MIZE_MODULE_NO_EXTERNALS", "1")
                 .env("MIZE_MODULE_PATH", &buildable.src_path)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                //.stdout(Stdio::piped())
+                //.stderr(Stdio::piped())
                 .spawn()?
             ;
 
@@ -331,7 +374,7 @@ impl DevModule {
     pub fn store_data(&self) -> MizeResult<()> {
         let data_path = PathBuf::from(self.instance.get("0/config/store_path")?.value_string()?).join("mize_dev_module").join("data.json");
 
-        serde_json::to_writer_pretty(File::options().write(true).open(&data_path)?, &self.data)
+        serde_json::to_writer_pretty(File::create(&data_path)?, &self.data)
             .mize_result_msg("failed to encode DevModuleData into json with serde")?;
 
         Ok(())
@@ -467,11 +510,21 @@ impl DevModule {
 
         for buildable in &self.data.buildables {
 
+            let system = buildable.config.get_path("system")?.value_string()?;
+            let src_path = &buildable.src_path;
+
             // we redirect all output from the command we spawn to stderr and stdout only gets the
             // pid from the prepended echo $$ command
             // like this we only need to capture output from stderr and only read_line() the pid
             // from stdout
-            let command = format!("bash -c 'echo $$; {} >2'\n", buildable.command);
+            let command = format!(r#"
+                bash -c 'echo $$
+                set -e
+                export out={}/dist/{system}
+                export build_dir={}
+                export debugOrRelease=debug
+                ( {} )>&2'
+            "#, src_path.display(), src_path.display(), buildable.command);
 
             let cancel_output_thread_one = Arc::new(AtomicBool::new(false));
             let cancel_output_thread_two = cancel_output_thread_one.clone();
@@ -490,11 +543,14 @@ impl DevModule {
 
             let mut stdout = self.dev_shells.get(&buildable.name).unwrap().stdout.lock()?;
             let mut pid_string = String::new();
+            println!("pid_string: {}", pid_string);
             stdout.read_line(&mut pid_string)?;
             pid_string.pop();
             let pid: i32 = pid_string.parse()?;
 
-            //println!("pid: {}", pid);
+            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), format!("pid of shell running the command: {}\n", pid))));
+            let child = &self.dev_shells.get(&buildable.name).unwrap().child;
+            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), format!("pid of devShell: {}\n", child.id()))));
 
             drop(stdout);
 
@@ -599,3 +655,28 @@ impl DevModule {
 
 
 
+fn handle_line(event_tx: Sender<DevModuleEvent>, instance: &mut Instance, line: String) -> MizeResult<()> {
+    let split_tmp = shell_words::split(line.as_str())
+        .mize_result_msg("dev module: error spliting the line read from pipe")?;
+    let split = split_tmp.iter().map(|v|v.as_str());
+
+    match split.clone().nth(0) {
+        // we got some output from the child stdin
+        Some("BuildOutput") => {
+            let name = split.clone().nth(1).unwrap_or("");
+            let output = split.clone().skip(2).collect::<Vec<&str>>().join(" ");
+            event_tx.send(DevModuleEvent::BuildOutput((name.to_string(), output.to_string())))?;
+        }
+
+        Some("BuildFinished") => {
+            let name = split.clone().nth(1).unwrap_or("");
+            event_tx.send(DevModuleEvent::BuildFinished(name.to_string()))?;
+        }
+
+        Some(_) | None => {
+            instance.report_err(mize_err!("dev module: invalid line read from pipe"));
+        }
+    }
+
+    Ok(())
+}
