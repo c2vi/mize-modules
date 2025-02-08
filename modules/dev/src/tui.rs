@@ -1,5 +1,10 @@
 
 use color_eyre::Result;
+use crossterm::event::DisableMouseCapture;
+use crossterm::event::EnableMouseCapture;
+use crossterm::event::MouseEventKind;
+use crossterm::Command as CrosstermCommand;
+use crossterm::ExecutableCommand;
 use ratatui::widgets::Cell;
 use ratatui::widgets::Table;
 use ratatui::widgets::Row;
@@ -45,6 +50,7 @@ const COMPLETED_TEXT_FG_COLOR: Color = GREEN.c500;
 
 pub struct TuiState {
     modules_state: TableState,
+    scroll_offset: u16,
     build_status: String,
 }
 
@@ -104,6 +110,7 @@ impl Tui<'_> {
         // if there is no tui state, initialize it
         if dev_module.tui_state.is_none() {
             dev_module.tui_state = Some( TuiState {
+                scroll_offset: 0,
                 modules_state: TableState::default(),
                 build_status: "idle".to_string(),
             });
@@ -115,9 +122,9 @@ impl Tui<'_> {
         // start ratatui
         color_eyre::install()?;
         let mut terminal = ratatui::init();
+        let mut stdout = std::io::stdout();
+        stdout.execute(EnableMouseCapture {});
 
-        // like this the run method can only be called once in the lifetime of the whole programm
-        // not even unloading the module would reset this thread....
         let tx = self.dev_module.event_tx.clone();
         let cancel_thread_one = Arc::new(AtomicBool::new(false));
         let cancel_thread_two = cancel_thread_one.clone();
@@ -148,6 +155,21 @@ impl Tui<'_> {
                 DevModuleEvent::Term(ev) => {
                     match ev {
                         Event::Key(key_event) => self.handle_key(key_event)?,
+                        Event::Mouse(mouse_event) => {
+                            match mouse_event.kind {
+                                MouseEventKind::ScrollUp => {
+                                    if self.state().scroll_offset > (u16::min_value() +3) {
+                                        self.state().scroll_offset -= 3;
+                                    }
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    if self.state().scroll_offset < (u16::max_value() -3) {
+                                        self.state().scroll_offset += 3;
+                                    }
+                                }
+                                _ => continue
+                            }
+                        }
                         _ => continue,
                     }
                 },
@@ -164,21 +186,26 @@ impl Tui<'_> {
                 },
 
                 DevModuleEvent::BuildOutput((name, line)) => {
-                    self.dev_module.outputs.get_mut(&name).ok_or(mize_err!("..."))?.push(line.clone());
+                    self.dev_module.outputs.get_mut(&name).ok_or(mize_err!("..."))?.push(line.clone() + "\n");
                     let mut file = OpenOptions::new()
                         .create(true)
                         .write(true)
                         .append(true)
                         .open(dir_path.as_path().join(format!("{}.log", name)))?;
-                    write!(file, "{}", line);
+                    write!(file, "{}\n", line);
                     //println!("output from {}: {}", name, line);
-                }
+                },
+
+                DevModuleEvent::RunBuild => {
+                    self.dev_module.run_build()?;
+                },
             }
 
         }
 
         // restore terminal
         ratatui::restore();
+        stdout.execute(DisableMouseCapture {});
 
         cancel_thread_one.store(true, Ordering::Relaxed);
         
@@ -205,12 +232,26 @@ impl Tui<'_> {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_exit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.dev_module.stop_dev_shells()?;
+                self.should_exit = true;
+            },
 
             KeyCode::Char('j') | KeyCode::Down => self.state().modules_state.select_next(),
             KeyCode::Char('k') | KeyCode::Up => self.state().modules_state.select_previous(),
             KeyCode::Char('g') | KeyCode::Home => self.state().modules_state.select_first(),
             KeyCode::Char('G') | KeyCode::End => self.state().modules_state.select_last(),
+
+            KeyCode::Char('u') | KeyCode::End => {
+                if self.state().scroll_offset > (u16::min_value() +3) {
+                    self.state().scroll_offset -= 3;
+                }
+            },
+            KeyCode::Char('i') | KeyCode::End => {
+                if self.state().scroll_offset < (u16::max_value() -3) {
+                    self.state().scroll_offset += 3;
+                }
+            },
 
             KeyCode::Char('r') | KeyCode::End => {
                 thread::spawn(|| {
@@ -296,6 +337,7 @@ impl Tui<'_> {
 
         Paragraph::new(info)
             .block(block)
+            .scroll((self.state().scroll_offset, 0))
             .fg(TEXT_FG_COLOR)
             .wrap(Wrap { trim: false })
             .render(area, buf);

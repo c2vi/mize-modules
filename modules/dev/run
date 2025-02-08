@@ -1,6 +1,7 @@
 set -e
 
 export MIZE_CONFIG=module_dir.dev=/home/me/work/modules/modules/dev/dist
+export MIZE_DEV_MODULE_HELPER=/home/me/work/modules/modules/dev/target/debug/dev
 
 function build_mize_dev() {
 
@@ -10,14 +11,16 @@ function build_mize_dev() {
   export MIZE_MODULE_NO_EXTERNALS=1
 
   cd ~/work/modules/modules/dev
-  nix develop ~/work/mize#modules.dev --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 --impure -c cargo build --lib
+  nix develop ~/work/mize#modules.dev --impure -c cargo build
+  # --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 
 
 
   mkdir -p ~/work/modules/modules/dev/dist/lib
   cp ~/work/modules/modules/dev/target/debug/libmize_module_dev.so ~/work/modules/modules/dev/dist/lib
 
   cd ~/work/mize
-  nix develop --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 --impure -c cargo build
+  nix develop --impure -c cargo build
+  # --override-input nixpkgs github:nixos/nixpkgs/ea6033ce4ddf2c0ede2ea147a450d4f880796128 
 
 }
 

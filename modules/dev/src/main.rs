@@ -5,6 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::thread;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use cmd_lib::run_cmd;
 use mize::{mize_err, MizeResult};
 use mize::Instance;
 use std::fs::{self, File};
@@ -40,9 +41,8 @@ fn main_with_error_handling(instance: &mut Instance) -> MizeResult<()> {
 
         let line = line.unwrap();
 
-        println!("got line: {}", line);
 
-        match handle_line(instance, line,buildable_name.clone(), pipe_path.clone()) {
+        match handle_line(instance, line, buildable_name.clone(), pipe_path.clone()) {
             Ok(true) => { break; },
             Ok(_) => {},
             Err(e) => {
@@ -56,15 +56,18 @@ fn main_with_error_handling(instance: &mut Instance) -> MizeResult<()> {
 
 // returns wether the program should exit
 fn handle_line(instance: &mut Instance, line: String, buildable_name: String, pipe_path: PathBuf) -> MizeResult<bool> {
-    let split_tmp = shell_words::split(&line)?;
-    let split = split_tmp.iter().map(|v|v.as_str());
+    //let split_tmp = shell_words::split(&line)?;
+    let split = line.split(" ");
+    //let split = split_tmp.iter().map(|v|v.as_str());
+
+    let mut pipe = OpenOptions::new().read(false).write(true).open(pipe_path.as_path())?;
 
     match split.clone().nth(0) {
         Some("Run") => {
             let encoded_string_to_run = split.clone().skip(1).collect::<Vec<&str>>().join(" ");
             let string_to_run = encoded_string_to_run.replace("\\n", "\n");
 
-            println!("got Run...: {}", encoded_string_to_run);
+            pipe.write_all(format!("BuildOutput {} dev module: got Run: {}\n", buildable_name, encoded_string_to_run).as_bytes().as_ref())?;
 
 
             let mut child = Command::new("bash")
@@ -75,7 +78,6 @@ fn handle_line(instance: &mut Instance, line: String, buildable_name: String, pi
                 .stderr(Stdio::piped())
                 .spawn()?;
 
-            println!("after spawn");
 
             // stdout thread
             let stdout = child.stdout.take().expect("child had no stdout");

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::stdout;
 use std::io::Read;
 use std::io::Stdin;
@@ -48,6 +49,9 @@ use ciborium::Value as CborValue;
 use clap::ArgMatches;
 use clap::Arg;
 use crate::tui::Tui;
+use nix::unistd::Pid;
+use nix::sys::signal::Signal;
+use nix::sys::signal::kill;
 
 
 pub mod tui;
@@ -60,8 +64,8 @@ pub struct DevModuleMutexed {
 struct MyChild {
     child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
-    stdout: Arc<Mutex<BufReader<ChildStdout>>>,
-    stderr: Arc<Mutex<BufReader<ChildStderr>>>,
+    //stdout: Arc<Mutex<BufReader<ChildStdout>>>,
+    //stderr: Arc<Mutex<BufReader<ChildStderr>>>,
 }
 
 pub struct DevModule {
@@ -78,7 +82,8 @@ pub struct DevModule {
 pub enum DevModuleEvent {
     Term(crossterm::event::Event),
     BuildFinished(String),
-    BuildOutput((String, String))
+    BuildOutput((String, String)),
+    RunBuild,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -250,6 +255,7 @@ impl DevModule {
 
     fn run_tui(&mut self) -> MizeResult<()> {
 
+
         self.load_data()?;
 
         self.start_pipe_listening_thread()?;
@@ -272,10 +278,10 @@ impl DevModule {
             run_cmd!("mkfifo" "$pipe_path")?;
         }
 
-        let pipe = BufReader::new(File::open(pipe_path)?);
         let mut instance_clone = self.instance.clone();
         let event_tx_clone = self.event_tx.clone();
         self.instance.spawn("dev_module_pipe_listener", move || {
+            let pipe = BufReader::new(File::open(pipe_path)?);
             for line in pipe.lines() {
                 match line {
                     Ok(line) => {
@@ -299,7 +305,7 @@ impl DevModule {
     fn start_dev_shells(&mut self) -> MizeResult<()> {
 
 
-        let host_system = run_fun!(nix eval --impure --expr "builtins.currentSystem")?;
+        let host_system = run_fun!(nix eval --impure --raw --expr "builtins.currentSystem")?;
 
         ///////////////// spawn dev shell for all Buildables
         for buildable in &self.data.buildables {
@@ -311,13 +317,15 @@ impl DevModule {
                 .map_err(|e| e.msg("The config of the Buildable does not have a modName attribute"))?
                 .value_string()?;
 
+            let helper_program_path = std::env::var("MIZE_DEV_MODULE_HELPER")?;
+
             println!("self.data.mize_flake: {}", self.data.mize_flake);
 
             //let dev_shell_path = format!("{}#packages.{}.mizeFor.{}.modules.{}.devShell", data.mize_flake, host_system, target_system, mod_name);
             let dev_shell_path = format!("{}#packages.{}.mizeFor.{}.modules.{}.devShell", self.data.mize_flake, host_system, target_system, mod_name);
             println!("dev_shell_path: {}", dev_shell_path);
 
-            let mut args = vec!["develop".to_owned(), "--impure".to_owned(), dev_shell_path];
+            let mut args = vec!["develop".to_owned(), dev_shell_path.clone(), "--impure".to_owned()];
 
             // add --override-input arg, when we have a config/override_nixpkgs set
             if let Ok(nixpkgs_path) = self.data.config.get_path("override_nixpkgs") {
@@ -325,30 +333,49 @@ impl DevModule {
                 args.push(arg);
             }
 
-            // 
             args.push("-c".to_owned());
-            args.push("bash".to_owned());
-            args.push("-i".to_owned());
+            args.push(helper_program_path);
+            args.push(buildable.name.clone());
+
+            //let debug_stdout = OpenOptions::new().write(true).read(false).open("/home/me/p1")?;
+            //let debug_stderr = OpenOptions::new().write(true).read(false).open("/home/me/p2")?;
 
             let mut child = Command::new("nix")
                 .args(args)
                 .env("MIZE_MODULE_NO_REPO", "1")
                 .env("MIZE_MODULE_NO_EXTERNALS", "1")
                 .env("MIZE_MODULE_PATH", &buildable.src_path)
+                //.env("RUST_LOG", "trace")
                 .stdin(Stdio::piped())
-                //.stdout(Stdio::piped())
-                //.stderr(Stdio::piped())
+                //.stdout(debug_stdout)
+                //.stderr(debug_stderr)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()?
             ;
 
+
             let my_child = MyChild {
                 stdin: Arc::new(Mutex::new(child.stdin.take().unwrap())),
-                stdout: Arc::new(Mutex::new(BufReader::new(child.stdout.take().unwrap()))),
-                stderr: Arc::new(Mutex::new(BufReader::new(child.stderr.take().unwrap()))),
+                //stdout: Arc::new(Mutex::new(BufReader::new(child.stdout.take().unwrap()))),
+                //stderr: Arc::new(Mutex::new(BufReader::new(child.stderr.take().unwrap()))),
                 child,
             };
 
             self.dev_shells.insert(buildable.name.clone(), my_child);
+        }
+
+        Ok(())
+    }
+
+    fn stop_dev_shells(&mut self) -> MizeResult<()> {
+
+        for (name, child) in self.dev_shells.iter_mut() {
+            child.stdin.lock()?.write_all("exit\n".to_owned().as_bytes().as_ref());
+        }
+
+        for (name, child) in self.dev_shells.iter_mut() {
+            kill(Pid::from_raw(child.child.id() as i32), Signal::SIGTERM).unwrap();
         }
 
         Ok(())
@@ -510,6 +537,9 @@ impl DevModule {
 
         for buildable in &self.data.buildables {
 
+            // writre new build heading
+            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), "\n\n\n\n\n######################### NEW BUILD #########################".to_owned())))?;
+
             let system = buildable.config.get_path("system")?.value_string()?;
             let src_path = &buildable.src_path;
 
@@ -517,73 +547,22 @@ impl DevModule {
             // pid from the prepended echo $$ command
             // like this we only need to capture output from stderr and only read_line() the pid
             // from stdout
-            let command = format!(r#"
-                bash -c 'echo $$
+            let mut command = format!(r#"Run 
                 set -e
                 export out={}/dist/{system}
                 export build_dir={}
                 export debugOrRelease=debug
-                ( {} )>&2'
-            "#, src_path.display(), src_path.display(), buildable.command);
+                {}
+            "#, src_path.display(), src_path.display(), buildable.command)
+                .replace("\n", "\\n"); // replace \n because we need to send this as one line to
+                                       // the stdin of the child helper program
 
-            let cancel_output_thread_one = Arc::new(AtomicBool::new(false));
-            let cancel_output_thread_two = cancel_output_thread_one.clone();
-            let cancel_output_thread_three = cancel_output_thread_one.clone();
+            command.push('\n');
 
-            //println!("command: {}",  command);
-
-            // write bash -c  to stdin of shell
             let mut stdin = self.dev_shells.get(&buildable.name).unwrap().stdin.lock()?;
 
-            //let mut tmp = Vec::new();
-            //stdout.buffer().
-            stdin.write_all(command.as_bytes());
-            drop(stdin);
+            stdin.write_all(command.as_bytes())?;
 
-
-            let mut stdout = self.dev_shells.get(&buildable.name).unwrap().stdout.lock()?;
-            let mut pid_string = String::new();
-            println!("pid_string: {}", pid_string);
-            stdout.read_line(&mut pid_string)?;
-            pid_string.pop();
-            let pid: i32 = pid_string.parse()?;
-
-            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), format!("pid of shell running the command: {}\n", pid))));
-            let child = &self.dev_shells.get(&buildable.name).unwrap().child;
-            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), format!("pid of devShell: {}\n", child.id()))));
-
-            drop(stdout);
-
-            self.event_tx.send(DevModuleEvent::BuildOutput((buildable.name.clone(), "############## NEW BUILD ##############\n".to_owned())))?;
-
-            // thread to read the stderr at the same time
-            let stderr_clone = self.dev_shells.get(&buildable.name).unwrap().stderr.clone();
-            let event_tx_clone = self.event_tx.clone();
-            let name_clone = buildable.name.clone();
-            std::thread::spawn(move || {
-                let mut buf = String::new();
-
-                let mut stderr = stderr_clone.lock().unwrap();
-
-                while !cancel_output_thread_two.load(std::sync::atomic::Ordering::Acquire) {
-                    buf.clear();
-
-                    stderr.read_line(&mut buf);
-
-                    event_tx_clone.send(DevModuleEvent::BuildOutput((name_clone.clone(), buf.clone())));
-                }
-            });
-          
-            // spawn thread, which waits for process by id to cancel and then sends an BuildFinished event
-            // and tells the output writing thread to exit
-            let event_tx_clone = self.event_tx.clone();
-            let name_clone = buildable.name.clone();
-            std::thread::spawn(move || {
-                let mut handle = waitpid_any::WaitHandle::open(pid).unwrap();
-                handle.wait().unwrap();
-                cancel_output_thread_three.store(true, std::sync::atomic::Ordering::Relaxed);
-                event_tx_clone.send(DevModuleEvent::BuildFinished(name_clone));
-            });
         }
 
 
@@ -671,6 +650,10 @@ fn handle_line(event_tx: Sender<DevModuleEvent>, instance: &mut Instance, line: 
         Some("BuildFinished") => {
             let name = split.clone().nth(1).unwrap_or("");
             event_tx.send(DevModuleEvent::BuildFinished(name.to_string()))?;
+        }
+
+        Some("Run") => {
+            event_tx.send(DevModuleEvent::RunBuild)?;
         }
 
         Some(_) | None => {
